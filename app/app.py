@@ -162,6 +162,8 @@ class HamamatsuTeensy:
 if __name__ == "__main__":
   hs = HamamatsuTeensy()
   hs.ping()
+  print("State:", hs.get_state())
+  hs.get_frame()
 
   # print("Faxitron state:", dalsa_teensy.get_faxitron_state())
   # dalsa_teensy.set_faxitron_exposure_time(30)

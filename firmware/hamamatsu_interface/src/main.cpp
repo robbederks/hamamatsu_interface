@@ -1,8 +1,29 @@
 #include <Arduino.h>
 #include <usb_custom.h>
 
-#define SENSOR_ROWS 1024
-#define SENSOR_COLUMNS 1024
+#define SENSOR_ROWS 1056
+#define SENSOR_COLUMNS 1056
+
+#define PIN_RX_ENABLE 6
+#define PIN_INT_EXT 11
+#define PIN_EXT_TRIGGER 12
+#define PIN_BIN0 24
+#define PIN_BIN1 25
+#define PIN_PCLK 26
+#define PIN_DATA_1 19
+#define PIN_DATA_2 18
+#define PIN_DATA_3 14
+#define PIN_DATA_4 15
+#define PIN_DATA_5 40
+#define PIN_DATA_6 41
+#define PIN_DATA_7 17
+#define PIN_DATA_8 16
+#define PIN_DATA_9 22
+#define PIN_DATA_10 23
+#define PIN_DATA_11 20
+#define PIN_DATA_12 21
+#define PIN_HSYNC 39
+#define PIN_VSYNC 38
 
 typedef struct __attribute__((__packed__)) {
   uint32_t row;
@@ -77,15 +98,53 @@ void setup() {
   // Setup Faxitron Serial
   Serial2.begin(9600, SERIAL_8N1);
 
+  // GPIO
+  pinMode(PIN_RX_ENABLE, OUTPUT);
+  pinMode(PIN_INT_EXT, OUTPUT);
+  pinMode(PIN_EXT_TRIGGER, OUTPUT);
+  pinMode(PIN_BIN0, OUTPUT);
+  pinMode(PIN_BIN1, OUTPUT);
+  pinMode(PIN_PCLK, INPUT);
+  pinMode(PIN_DATA_1, INPUT);
+  pinMode(PIN_DATA_2, INPUT);
+  pinMode(PIN_DATA_3, INPUT);
+  pinMode(PIN_DATA_4, INPUT);
+  pinMode(PIN_DATA_5, INPUT);
+  pinMode(PIN_DATA_6, INPUT);
+  pinMode(PIN_DATA_7, INPUT);
+  pinMode(PIN_DATA_8, INPUT);
+  pinMode(PIN_DATA_9, INPUT);
+  pinMode(PIN_DATA_10, INPUT);
+  pinMode(PIN_DATA_11, INPUT);
+  pinMode(PIN_DATA_12, INPUT);
+  pinMode(PIN_HSYNC, INPUT);
+  pinMode(PIN_VSYNC, INPUT);
+
+  digitalWrite(PIN_RX_ENABLE, HIGH);
+  digitalWrite(PIN_INT_EXT, HIGH);
+  digitalWrite(PIN_EXT_TRIGGER, LOW);
+  digitalWrite(PIN_BIN0, LOW);
+  digitalWrite(PIN_BIN1, LOW);
+
   // USB handler
   usb_custom_set_handler(usb_handler);
 }
 
+bool prev_vsync = false;
+bool prev_trig = false;
+uint32_t i = 0;
 void loop() {
-  // put your main code here, to run repeatedly:
-}
+  bool sync = digitalRead(PIN_VSYNC);
+  if (sync && !prev_vsync) {
+    Serial.write(sync ? "1\n" : "0\n");
+    prev_vsync = sync;
+  }
 
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
+  if (i > 1000000) {
+    digitalWrite(PIN_EXT_TRIGGER, prev_trig);
+    prev_trig = !prev_trig;
+    Serial.write("Trigger\n");
+    i = 0;
+  }
+  i++;
 }
