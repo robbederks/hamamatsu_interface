@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import usb1
+import time
 import struct
+import numpy as np
 from threading import Lock
 
 class HamamatsuTeensy:
@@ -10,7 +12,7 @@ class HamamatsuTeensy:
   CONTROL_IN_ENDPOINT = 6
   BULK_IN_ENDPOINT = 7
 
-  STRUCT_STATE = struct.Struct("<II??")
+  STRUCT_STATE = struct.Struct("<BII")
 
   FAXITRON_STATE_WARMING_UP = "warming_up"
   FAXITRON_STATE_DOOR_OPEN = "door_open"
@@ -19,8 +21,8 @@ class HamamatsuTeensy:
   FAXITRON_MODE_FRONT_PANEL = "front_panel"
   FAXITRON_MODE_REMOTE = "remote"
 
-  FRAME_WIDTH = 1024 + 8
-  FRAME_HEIGHT = 1024 + 18
+  FRAME_WIDTH = 1056
+  FRAME_HEIGHT = 1056
 
   def __init__(self):
     self._handle = None
@@ -32,7 +34,7 @@ class HamamatsuTeensy:
       self._handle.close()
 
     self._handle = usb1.USBContext().openByVendorIDAndProductID(0x16c0, 0x0483)
-    assert self._handle is not None, "Could not find Dalsa Teensy. Make sure it's connected."
+    assert self._handle is not None, "Could not find Teensy. Make sure it's connected."
 
     self._handle.claimInterface(HamamatsuTeensy.CUSTOM_INTERFACE)
 
@@ -56,7 +58,9 @@ class HamamatsuTeensy:
       length=size,
     )
 
-  def _command(self, cmd, data):
+  def _command(self, cmd, data=None):
+    if data is None:
+      data = b""
     self._control_out(struct.pack("<BI", cmd, len(data)) + data)
     resp = self._control_in(512)
     if len(resp) < 4:
@@ -84,10 +88,9 @@ class HamamatsuTeensy:
     assert len(dat) == self.STRUCT_STATE.size, f"Response does not match expected struct size: {len(dat)} != {self.STRUCT_STATE.size}"
     dat_unpacked = self.STRUCT_STATE.unpack(dat)
     return {
-      'row': dat_unpacked[0],
-      'col': dat_unpacked[1],
-      'busy': dat_unpacked[2],
-      'done': dat_unpacked[3],
+      'state': dat_unpacked[0],
+      'row': dat_unpacked[1],
+      'col': dat_unpacked[2],
     }
 
   def get_frame(self):
@@ -96,11 +99,11 @@ class HamamatsuTeensy:
     frame_len = struct.unpack("<I", dat[:4])[0]
     return self._bulk_in(frame_len)
 
-  def start_readout(self, high_gain=False):
-    dat = self._command(0x03, b"\x01" if high_gain else b"\x00")
+  def start_trigger(self):
+    dat = self._command(0x03)
     assert len(dat) == 1, "Response does not match expected size"
     if dat[0] != 0:
-      raise Exception("Failed to start readout, is another readout in progress?")
+      raise Exception("Failed to start trigger, is another readout in progress?")
 
   def get_faxitron_state(self):
     dat = self._faxitron_serial_command(b"?S").decode()
@@ -163,7 +166,20 @@ if __name__ == "__main__":
   hs = HamamatsuTeensy()
   hs.ping()
   print("State:", hs.get_state())
-  hs.get_frame()
+  hs.start_trigger()
+  while hs.get_state()['state'] != 3:
+    time.sleep(0.1)
+
+  dt = np.dtype(np.uint16)
+  dt = dt.newbyteorder('<')
+  frame = np.frombuffer(hs.get_frame(), dtype=dt).reshape((HamamatsuTeensy.FRAME_HEIGHT, HamamatsuTeensy.FRAME_WIDTH))
+  print("Frame:", frame.shape)
+
+  print(frame[100:200, 100:110])
+
+  import matplotlib.pyplot as plt
+  plt.imshow(frame, cmap='gray')
+  plt.show()
 
   # print("Faxitron state:", dalsa_teensy.get_faxitron_state())
   # dalsa_teensy.set_faxitron_exposure_time(30)

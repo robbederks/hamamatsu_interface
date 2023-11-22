@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <usb_custom.h>
+#include <imxrt.h>
 
 #define SENSOR_ROWS 1056
 #define SENSOR_COLUMNS 1056
@@ -25,11 +26,15 @@
 #define PIN_HSYNC 39
 #define PIN_VSYNC 38
 
+#define STATE_IDLE 0
+#define STATE_WAITING_ON_VSYNC 1
+#define STATE_ACQUIRING 2
+#define STATE_DONE 3
+
 typedef struct __attribute__((__packed__)) {
+  uint8_t state;
   uint32_t row;
   uint32_t col;
-  bool busy;
-  bool done;
 } readout_state;
 volatile readout_state state;
 
@@ -65,10 +70,12 @@ uint32_t usb_handler(uint8_t *control_data, uint32_t len, uint8_t *return_data, 
       return_data[0] = 0xA5;
       return_len = 1;
       break;
+
     case 0x01: // Check state
       memcpy(return_data, &state, sizeof(state));
       return_len = sizeof(state);
       break;
+
     case 0x02: // Get pixel buffer
       // setup bulk transfer
       usb_custom_init_bulk_transfer((uint8_t *) pixel_buffer, sizeof(pixel_buffer), 0);
@@ -77,6 +84,20 @@ uint32_t usb_handler(uint8_t *control_data, uint32_t len, uint8_t *return_data, 
       *((uint32_t *)return_data) = sizeof(pixel_buffer);
       return_len = sizeof(uint32_t);
       break;
+
+    case 0x03: // Start trigger
+      if (state.state != STATE_IDLE && state.state != STATE_DONE) {
+        Serial.write("Already busy!\n");
+        return_data[0] = 0x01;
+      } else {
+        memset(pixel_buffer, 0xFF, sizeof(pixel_buffer));
+        state.state = STATE_WAITING_ON_VSYNC;
+        digitalWrite(PIN_EXT_TRIGGER, HIGH);
+        return_data[0] = 0x00;
+      }
+      return_len = 1;
+      break;
+
     case 0x10: // Get Faxitron status
       return_len = faxitron_command(req->data, req->data_len, return_data, 10);
       break;
@@ -89,6 +110,44 @@ uint32_t usb_handler(uint8_t *control_data, uint32_t len, uint8_t *return_data, 
 
 end:
   return return_len;
+}
+
+void pclk_interrupt() {
+  if (state.state != STATE_ACQUIRING) {
+    return;
+  }
+
+  // Read full port to get 12-bit data
+  pixel_buffer[state.row][state.col] = (GPIO6_PSR >> 16) & 0xFFF;
+  state.col++;
+}
+
+void vsync_interrupt() {
+  if (state.state == STATE_WAITING_ON_VSYNC) {
+    state.state = STATE_ACQUIRING;
+    state.row = 0;
+    state.col = 0;
+  }
+}
+
+void hsync_interrupt() {
+  if (state.state == STATE_ACQUIRING) {
+    if (state.row % 100 == 0) {
+      Serial.printf("Row %d cols %d\n", state.row-1, state.col);
+    }
+
+    state.col = 0;
+    state.row++;
+    if (state.row == SENSOR_ROWS) {
+      state.state = STATE_DONE;
+      Serial.write("Done!\n");
+      Serial.flush();
+    }
+
+    if (state.row == SENSOR_ROWS / 2) {
+      digitalWrite(PIN_EXT_TRIGGER, LOW);
+    }
+  }
 }
 
 void setup() {
@@ -126,25 +185,13 @@ void setup() {
   digitalWrite(PIN_BIN0, LOW);
   digitalWrite(PIN_BIN1, LOW);
 
+  // Setup interrupt on pclk
+  attachInterrupt(digitalPinToInterrupt(PIN_PCLK), pclk_interrupt, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_VSYNC), vsync_interrupt, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_HSYNC), hsync_interrupt, RISING);
+
   // USB handler
   usb_custom_set_handler(usb_handler);
 }
 
-bool prev_vsync = false;
-bool prev_trig = false;
-uint32_t i = 0;
-void loop() {
-  bool sync = digitalRead(PIN_VSYNC);
-  if (sync && !prev_vsync) {
-    Serial.write(sync ? "1\n" : "0\n");
-    prev_vsync = sync;
-  }
-
-  if (i > 1000000) {
-    digitalWrite(PIN_EXT_TRIGGER, prev_trig);
-    prev_trig = !prev_trig;
-    Serial.write("Trigger\n");
-    i = 0;
-  }
-  i++;
-}
+void loop() {}
