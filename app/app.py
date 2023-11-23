@@ -175,7 +175,11 @@ if __name__ == "__main__":
   frame = np.frombuffer(hs.get_frame(), dtype=dt).reshape((HamamatsuTeensy.FRAME_HEIGHT, HamamatsuTeensy.FRAME_WIDTH))
   print("Frame:", frame.shape)
 
-  print(frame[100:200, 100:110])
+  frame = np.clip(frame, 0, 4095)
+
+  # print(frame[100:200, 100:110])
+  for i in list(map(lambda i: bin(i), frame[110, 100:150].flatten())):
+    print(i)
 
   import matplotlib.pyplot as plt
   plt.imshow(frame, cmap='gray')
