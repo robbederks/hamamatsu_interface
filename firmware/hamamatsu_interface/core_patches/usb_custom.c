@@ -61,11 +61,20 @@ static transfer_t bulk_transfer __attribute__ ((used, aligned(32)));
 static uint8_t *bulk_data __attribute__ ((aligned(32))) = NULL;
 static uint32_t bulk_len_remaining = 0;
 
-void usb_custom_init_bulk_transfer(uint8_t *buffer, uint32_t len) {
-  bulk_data = buffer;
-  bulk_len_remaining = len;
+void usb_custom_init_bulk_transfer(uint8_t *buffer, uint32_t len, uint8_t transfer_id) {
+  (void)transfer_id; // unused for now
 
-  if (buffer == NULL || len == 0) {
+  // On first call, flush the entire buffer to ensure PSRAM has current data
+  // (caller should have already flushed for EXTMEM buffers, but this ensures internal RAM works too)
+  if (bulk_data != buffer || bulk_len_remaining == 0) {
+    bulk_data = buffer;
+    bulk_len_remaining = len;
+    if (buffer != NULL && len > 0) {
+      arm_dcache_flush_delete(buffer, len);
+    }
+  }
+
+  if (bulk_data == NULL || bulk_len_remaining == 0) {
     return;
   }
 
@@ -74,7 +83,6 @@ void usb_custom_init_bulk_transfer(uint8_t *buffer, uint32_t len) {
   uint32_t transfer_len = bulk_len_remaining > tx_packet_size ? tx_packet_size : bulk_len_remaining;
 
   usb_prepare_transfer(&bulk_transfer, bulk_data, transfer_len, 0);
-  arm_dcache_flush_delete(return_data, transfer_len);
   usb_transmit(CUSTOM_BULK_ENDPOINT, &bulk_transfer);
   NVIC_ENABLE_IRQ(IRQ_USB1);
 
@@ -85,7 +93,7 @@ void usb_custom_init_bulk_transfer(uint8_t *buffer, uint32_t len) {
 
 static void bulk_event(transfer_t *t) {
   // queue next transfer
-  usb_custom_init_bulk_transfer(bulk_data, bulk_len_remaining);
+  usb_custom_init_bulk_transfer(bulk_data, bulk_len_remaining, 0);
 }
 
 void usb_custom_configure (void) {

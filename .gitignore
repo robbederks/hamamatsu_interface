@@ -8,3 +8,4 @@ e2i
 sdk/
 __pycache__
 .vscode/
+*.code-workspace

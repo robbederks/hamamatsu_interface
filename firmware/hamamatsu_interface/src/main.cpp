@@ -28,6 +28,8 @@ const uint16_t reverse_table[4096] = {0x0, 0x800, 0x400, 0xc00, 0x200, 0xa00, 0x
 #define PIN_HSYNC 39
 #define PIN_VSYNC 38
 
+#define GPIO6_DATA_SHIFT 16
+
 #define STATE_IDLE 0
 #define STATE_WAITING_ON_VSYNC 1
 #define STATE_ACQUIRING 2
@@ -46,8 +48,8 @@ typedef struct __attribute__((__packed__)) {
   uint8_t data[64 - 5];
 } control_req_t;
 
-EXTMEM uint16_t pixel_buffer[SENSOR_ROWS][SENSOR_COLUMNS]; // External RAM is neccesary to fit the buffer
-volatile bool hsync_status = false;
+EXTMEM uint16_t pixel_buffer[SENSOR_ROWS][SENSOR_COLUMNS];
+DMAMEM uint16_t row_buffer[SENSOR_COLUMNS];
 
 uint32_t faxitron_command(uint8_t* command, uint32_t command_len, uint8_t *response, uint32_t max_response_len) {
   if (command_len > 0) {
@@ -68,40 +70,39 @@ uint32_t usb_handler(uint8_t *control_data, uint32_t len, uint8_t *return_data, 
   }
 
   switch (req->command) {
-    case 0x00: // Ping
+    case 0x00:
       Serial.write("Ping!\n");
       return_data[0] = 0xA5;
       return_len = 1;
       break;
 
-    case 0x01: // Check state
-      memcpy(return_data, &state, sizeof(state));
+    case 0x01:
+      memcpy(return_data, (const void*)&state, sizeof(state));
       return_len = sizeof(state);
       break;
 
-    case 0x02: // Get pixel buffer
-      // setup bulk transfer
+    case 0x02:
       usb_custom_init_bulk_transfer((uint8_t *) pixel_buffer, sizeof(uint16_t) * SENSOR_ROWS * SENSOR_COLUMNS, 0);
-
-      // return the size of the buffer
       *((uint32_t *)return_data) = sizeof(uint16_t) * SENSOR_ROWS * SENSOR_COLUMNS;
       return_len = sizeof(uint32_t);
       break;
 
-    case 0x03: // Start trigger
+    case 0x03:
       if (state.state != STATE_IDLE && state.state != STATE_DONE) {
         Serial.write("Already busy!\n");
         return_data[0] = 0x01;
       } else {
         memset(pixel_buffer, 0xFF, sizeof(uint16_t) * SENSOR_ROWS * SENSOR_COLUMNS);
         state.state = STATE_WAITING_ON_VSYNC;
+        state.row = 0;
+        state.col = 0;
         digitalWrite(PIN_EXT_TRIGGER, HIGH);
         return_data[0] = 0x00;
       }
       return_len = 1;
       break;
 
-    case 0x10: // Get Faxitron status
+    case 0x10:
       return_len = faxitron_command(req->data, req->data_len, return_data, 10);
       break;
 
@@ -115,64 +116,83 @@ end:
   return return_len;
 }
 
-void pclk_interrupt() {
-  if (state.state != STATE_ACQUIRING) {
-    return;
+// GPIO1 bit positions for sync signals (Pin 26=PCLK, Pin 38=VSYNC, Pin 39=HSYNC)
+// Teensy 4.1: Pin 26 -> GPIO1 bit 30, Pin 38 -> GPIO1 bit 28, Pin 39 -> GPIO1 bit 29
+#define GPIO1_PCLK_BIT  30
+#define GPIO1_VSYNC_BIT 28
+#define GPIO1_HSYNC_BIT 29
+#define GPIO1_PCLK_MASK  (1UL << GPIO1_PCLK_BIT)
+#define GPIO1_VSYNC_MASK (1UL << GPIO1_VSYNC_BIT)
+#define GPIO1_HSYNC_MASK (1UL << GPIO1_HSYNC_BIT)
+
+// Highly optimized acquisition - write directly to EXTMEM, no inter-row processing
+FASTRUN void acquire_frame() {
+  uint32_t gpio1_val;
+  uint32_t last_pclk;
+  uint16_t *buf_ptr;
+
+  // Wait for VSYNC rising edge
+  while (!(GPIO1_PSR & GPIO1_VSYNC_MASK)) {
+    if (state.state != STATE_WAITING_ON_VSYNC) return;
   }
 
-  if (hsync_status == false) {
-    // Not in frame
-    return;
-  }
+  state.state = STATE_ACQUIRING;
 
-  cli();
-  // Read full port to get 12-bit data
-  if (state.col < SENSOR_COLUMNS) {
-    pixel_buffer[state.row][state.col] = reverse_table[(GPIO6_PSR >> 16) & 0xFFF];
-  }
-  state.col++;
-  sei();
-}
+  // Disable interrupts during acquisition for consistent timing
+  __disable_irq();
 
-void vsync_interrupt() {
-  if (state.state == STATE_WAITING_ON_VSYNC) {
-    state.col = 0;
-    state.row = 0;
-    state.state = STATE_ACQUIRING;
-  }
-}
+  for (uint32_t row = 0; row < SENSOR_ROWS; row++) {
+    state.row = row;
+    buf_ptr = pixel_buffer[row];  // Write directly to EXTMEM
 
-void hsync_interrupt() {
-  hsync_status = digitalRead(PIN_HSYNC);
-  if (state.state == STATE_ACQUIRING && hsync_status == true) {
-    cli();
-    state.col = 0;
-    state.row++;
-    sei();
-
-    if (state.row == SENSOR_ROWS) {
-      state.state = STATE_DONE;
-      Serial.write("Done!\n");
-      Serial.flush();
-
-      // Flush cache
-      arm_dcache_flush_delete(pixel_buffer, sizeof(pixel_buffer));
+    // Wait for HSYNC high (start of row)
+    while (!(GPIO1_PSR & GPIO1_HSYNC_MASK)) {
+      // No abort check during critical timing - too slow
     }
 
-    if (state.row == SENSOR_ROWS / 2) {
-      digitalWrite(PIN_EXT_TRIGGER, LOW);
+    // Capture pixels while HSYNC is high using rising edge detection
+    last_pclk = 0;
+    uint16_t *buf_end = buf_ptr + SENSOR_COLUMNS;
+
+    while ((gpio1_val = GPIO1_PSR) & GPIO1_HSYNC_MASK) {
+      uint32_t pclk = gpio1_val & GPIO1_PCLK_MASK;
+
+      // Rising edge detection
+      if (pclk && !last_pclk) {
+        if (buf_ptr < buf_end) {
+          *buf_ptr++ = (GPIO6_PSR >> GPIO6_DATA_SHIFT) & 0xFFF;
+        }
+      }
+      last_pclk = pclk;
+    }
+
+    state.col = buf_ptr - pixel_buffer[row];
+
+    // Turn off trigger at midpoint (minimal overhead)
+    if (row == SENSOR_ROWS / 2) {
+      GPIO7_DR_CLEAR = (1 << 1);  // Pin 12 is GPIO7 bit 1
     }
   }
+
+  __enable_irq();
+
+  // Do bit reversal as post-processing (after all rows captured)
+  for (uint32_t row = 0; row < SENSOR_ROWS; row++) {
+    for (uint32_t col = 0; col < SENSOR_COLUMNS; col++) {
+      pixel_buffer[row][col] = reverse_table[pixel_buffer[row][col] & 0xFFF];
+    }
+  }
+
+  state.state = STATE_DONE;
+  Serial.write("Done!\n");
+  Serial.flush();
+  arm_dcache_flush_delete(pixel_buffer, sizeof(pixel_buffer));
 }
 
 void setup() {
-  // Setup USB Serial
   Serial.begin(115200);
-
-  // Setup Faxitron Serial
   Serial2.begin(9600, SERIAL_8N1);
 
-  // GPIO
   pinMode(PIN_RX_ENABLE, OUTPUT);
   pinMode(PIN_INT_EXT, OUTPUT);
   pinMode(PIN_EXT_TRIGGER, OUTPUT);
@@ -200,13 +220,12 @@ void setup() {
   digitalWrite(PIN_BIN0, LOW);
   digitalWrite(PIN_BIN1, LOW);
 
-  // Setup interrupt on pclk
-  attachInterrupt(digitalPinToInterrupt(PIN_PCLK), pclk_interrupt, RISING);
-  attachInterrupt(digitalPinToInterrupt(PIN_VSYNC), vsync_interrupt, RISING);
-  attachInterrupt(digitalPinToInterrupt(PIN_HSYNC), hsync_interrupt, CHANGE);
-
-  // USB handler
   usb_custom_set_handler(usb_handler);
+  state.state = STATE_IDLE;
 }
 
-void loop() {}
+void loop() {
+  if (state.state == STATE_WAITING_ON_VSYNC) {
+    acquire_frame();
+  }
+}

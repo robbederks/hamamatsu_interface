@@ -52,11 +52,19 @@ class HamamatsuTeensy:
       length=size,
     )
 
-  def _bulk_in(self, size):
-    return self._handle.bulkRead(
-      endpoint=HamamatsuTeensy.BULK_IN_ENDPOINT,
-      length=size,
-    )
+  def _bulk_in(self, size, timeout=30000):
+    data = b""
+    while len(data) < size:
+      remaining = size - len(data)
+      chunk = self._handle.bulkRead(
+        endpoint=HamamatsuTeensy.BULK_IN_ENDPOINT,
+        length=remaining,
+        timeout=timeout,
+      )
+      if len(chunk) == 0:
+        break
+      data += chunk
+    return data
 
   def _command(self, cmd, data=None):
     if data is None:
@@ -178,8 +186,8 @@ if __name__ == "__main__":
   frame = np.clip(frame, 0, 4095)
 
   # print(frame[100:200, 100:110])
-  for i in list(map(lambda i: bin(i), frame[110, 100:150].flatten())):
-    print(i)
+  # for i in list(map(lambda i: bin(i), frame[110, 100:150].flatten())):
+  #   print(i)
 
   import matplotlib.pyplot as plt
   plt.imshow(frame, cmap='gray')
