@@ -4,19 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Hamamatsu camera interface combining Teensy 4.1 firmware (C++) with a Python USB control application. Interfaces with a Hamamatsu C7921CA-02 X-ray flat panel sensor and Faxitron X-ray system.
+Hamamatsu camera interface combining Teensy 4.1 firmware (C++) with a Python USB control application. Interfaces with a Hamamatsu C7942 X-ray flat panel sensor and Faxitron X-ray system.
 
-## Sensor: Hamamatsu C7921CA-02
+## Sensor: Hamamatsu C7942
 
-- **Pixel array**: 1056 x 1056 (1032 x 1012 effective)
+- **Pixel array**: 2400 x 2400 (native), 2400 x 2320 captured (12-bit packed to fit 8MB PSRAM)
 - **Pixel size**: 50 um
-- **Active area**: 52.8 x 52.8 mm
-- **Output**: 12-bit RS422 differential at 6.25 MHz
-- **Frame rate**: 4 fps (1x1), 8 fps (2x2 binning), 16 fps (4x4 binning)
-- **Scintillator**: CsI:Tl (conventional coupling)
+- **Active area**: 120 x 120 mm
+- **Output**: 12-bit RS422 differential at 12.5 MHz
+- **Frame rate**: 2 fps (1x1), 4 fps (2x2 binning)
+- **Scintillator**: CsI:Tl
 - **X-ray energy range**: 20-100 kVp
 
-The pixel buffer is stored in EXTMEM (Teensy 4.1 external PSRAM) due to its 2MB+ size.
+The pixel buffer uses 12-bit packing (2 pixels = 3 bytes) in EXTMEM (Teensy 4.1 PSRAM). Frame is 2400×2320 (8.35 MB packed) to fit in 8MB PSRAM.
 
 ## Build Commands
 

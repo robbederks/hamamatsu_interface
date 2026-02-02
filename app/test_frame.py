@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script for Hamamatsu C7921CA-02 frame acquisition debugging.
+Test script for Hamamatsu C7942 frame acquisition debugging.
 Outputs frame statistics to help diagnose transfer issues.
 """
 
@@ -17,9 +17,29 @@ CONTROL_OUT_ENDPOINT = 5
 CONTROL_IN_ENDPOINT = 6
 BULK_IN_ENDPOINT = 7
 
-FRAME_WIDTH = 1056
-FRAME_HEIGHT = 1056
-FRAME_BYTES = FRAME_WIDTH * FRAME_HEIGHT * 2  # 2,230,272 bytes
+# Full resolution: 2400x2320 (slight vertical crop)
+# 12-bit packed: 2400x2320x1.5 = 8,352,000 bytes
+FRAME_WIDTH = 2400
+FRAME_HEIGHT = 2320
+FRAME_BYTES = FRAME_WIDTH * FRAME_HEIGHT * 3 // 2  # 12-bit packed
+
+
+def unpack_12bit(packed_data):
+    """Unpack 12-bit packed data to 16-bit array.
+    Layout: byte0 = p0[7:0], byte1 = p1[3:0]<<4 | p0[11:8], byte2 = p1[11:4]
+    """
+    import numpy as np
+    packed = np.frombuffer(packed_data, dtype=np.uint8)
+    # Reshape to groups of 3 bytes
+    packed = packed[:len(packed) - len(packed) % 3].reshape(-1, 3)
+    # Unpack two 12-bit values from each 3-byte group
+    p0 = (packed[:, 0].astype(np.uint16)) | ((packed[:, 1].astype(np.uint16) & 0x0F) << 8)
+    p1 = ((packed[:, 1].astype(np.uint16) >> 4)) | (packed[:, 2].astype(np.uint16) << 4)
+    # Interleave
+    result = np.empty(len(p0) * 2, dtype=np.uint16)
+    result[0::2] = p0
+    result[1::2] = p1
+    return result
 
 
 def connect():
@@ -118,20 +138,18 @@ def analyze_frame(data):
     if len(data) < FRAME_BYTES:
         print(f"WARNING: Incomplete frame: {len(data)}/{FRAME_BYTES} bytes ({100*len(data)/FRAME_BYTES:.1f}%)")
 
-    # Convert to 16-bit values
-    import array
-    pixels = array.array('H')
-    pixels.frombytes(data[:len(data) - len(data) % 2])
+    # Unpack 12-bit data to 16-bit values
+    pixels = unpack_12bit(data)
 
-    # Buffer is initialized to 0xFFFF, so "empty" pixels are 65535
-    EMPTY_VALUE = 65535
+    # Buffer is initialized to 0xFFF (4095), so "empty" pixels are 4095
+    EMPTY_VALUE = 4095
 
     valid_count = sum(1 for p in pixels if p != EMPTY_VALUE)
     empty_count = len(pixels) - valid_count
 
     print(f"Total pixels: {len(pixels)}")
-    print(f"Valid pixels (not 0xFFFF): {valid_count} ({100*valid_count/len(pixels):.1f}%)")
-    print(f"Empty pixels (0xFFFF): {empty_count} ({100*empty_count/len(pixels):.1f}%)")
+    print(f"Valid pixels (not 0xFFF): {valid_count} ({100*valid_count/len(pixels):.1f}%)")
+    print(f"Empty pixels (0xFFF): {empty_count} ({100*empty_count/len(pixels):.1f}%)")
 
     if len(pixels) > 0:
         min_val = min(pixels)
@@ -196,7 +214,7 @@ def analyze_frame(data):
 
 def main():
     print("=" * 60)
-    print("Hamamatsu C7921CA-02 Frame Acquisition Test")
+    print("Hamamatsu C7942 Frame Acquisition Test")
     print("=" * 60)
     print(f"Expected frame: {FRAME_WIDTH}x{FRAME_HEIGHT} = {FRAME_WIDTH*FRAME_HEIGHT} pixels")
     print(f"Expected bytes: {FRAME_BYTES}")

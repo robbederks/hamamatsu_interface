@@ -21,8 +21,21 @@ class HamamatsuTeensy:
   FAXITRON_MODE_FRONT_PANEL = "front_panel"
   FAXITRON_MODE_REMOTE = "remote"
 
-  FRAME_WIDTH = 1056
-  FRAME_HEIGHT = 1056
+  # Full resolution: 2400x2320 (slight vertical crop), 12-bit packed
+  FRAME_WIDTH = 2400
+  FRAME_HEIGHT = 2320
+
+  @staticmethod
+  def unpack_12bit(packed_data):
+    """Unpack 12-bit packed data to 16-bit array."""
+    packed = np.frombuffer(packed_data, dtype=np.uint8)
+    packed = packed[:len(packed) - len(packed) % 3].reshape(-1, 3)
+    p0 = (packed[:, 0].astype(np.uint16)) | ((packed[:, 1].astype(np.uint16) & 0x0F) << 8)
+    p1 = ((packed[:, 1].astype(np.uint16) >> 4)) | (packed[:, 2].astype(np.uint16) << 4)
+    result = np.empty(len(p0) * 2, dtype=np.uint16)
+    result[0::2] = p0
+    result[1::2] = p1
+    return result
 
   def __init__(self):
     self._handle = None
@@ -173,14 +186,27 @@ class HamamatsuTeensy:
 if __name__ == "__main__":
   hs = HamamatsuTeensy()
   hs.ping()
+
+  # Take first frame (discard - sensor may be saturated)
+  #print("Taking first frame (will be discarded)...")
+  #hs.start_trigger()
+  #while hs.get_state()['state'] != 3:
+  #  time.sleep(0.1)
+  #_ = hs.get_frame()  # Discard first frame
+
+  # Wait 1 second for sensor to settle
+  #print("Waiting 1 second...")
+  #time.sleep(1.0)
+
+  # Take second frame (keep this one)
+  print("Taking second frame...")
   print("State:", hs.get_state())
   hs.start_trigger()
   while hs.get_state()['state'] != 3:
     time.sleep(0.1)
 
-  dt = np.dtype(np.uint16)
-  dt = dt.newbyteorder('<')
-  frame = np.frombuffer(hs.get_frame(), dtype=dt).reshape((HamamatsuTeensy.FRAME_HEIGHT, HamamatsuTeensy.FRAME_WIDTH))
+  # Unpack 12-bit data to 16-bit
+  frame = HamamatsuTeensy.unpack_12bit(hs.get_frame()).reshape((HamamatsuTeensy.FRAME_HEIGHT, HamamatsuTeensy.FRAME_WIDTH))
   print("Frame:", frame.shape)
 
   frame = np.clip(frame, 0, 4095)
