@@ -12,7 +12,7 @@ class HamamatsuTeensy:
   CONTROL_IN_ENDPOINT = 6
   BULK_IN_ENDPOINT = 7
 
-  STRUCT_STATE = struct.Struct("<BII")
+  STRUCT_STATE = struct.Struct("<BIIBII")
 
   FAXITRON_STATE_WARMING_UP = "warming_up"
   FAXITRON_STATE_DOOR_OPEN = "door_open"
@@ -112,6 +112,9 @@ class HamamatsuTeensy:
       'state': dat_unpacked[0],
       'row': dat_unpacked[1],
       'col': dat_unpacked[2],
+      'stop_reason': dat_unpacked[3],
+      'dma_wait': dat_unpacked[4],
+      'overhead_max_us': dat_unpacked[5],
     }
 
   def get_frame(self):

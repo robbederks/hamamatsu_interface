@@ -78,9 +78,12 @@ def ping(handle):
 def get_state(handle):
     """Get firmware state."""
     dat = command(handle, 0x01)
-    state, row, col = struct.unpack("<BII", dat)
+    state, row, col, stop_reason, dma_wait, overhead_us = struct.unpack("<BIIBII", dat)
     state_names = {0: "IDLE", 1: "WAITING_ON_VSYNC", 2: "ACQUIRING", 3: "DONE"}
-    print(f"State: {state_names.get(state, state)}, row={row}, col={col}")
+    stop_names = {0: "normal", 1: "hsync_timeout"}
+    print(f"State: {state_names.get(state, state)}, row={row}, col={col}, "
+          f"stop={stop_names.get(stop_reason, stop_reason)}, "
+          f"dma_wait={dma_wait}, overhead_max={overhead_us}us")
     return state, row, col
 
 
@@ -141,15 +144,16 @@ def analyze_frame(data):
     # Unpack 12-bit data to 16-bit values
     pixels = unpack_12bit(data)
 
-    # Buffer is initialized to 0xFFF (4095), so "empty" pixels are 4095
-    EMPTY_VALUE = 4095
+    # Buffer is initialized to 0xAA bytes (unpacks to 0xAAA = 2730)
+    # After firmware bit-reversal: 0xAAA -> 0x555 = 1365
+    EMPTY_VALUE = 0x555
 
     valid_count = sum(1 for p in pixels if p != EMPTY_VALUE)
     empty_count = len(pixels) - valid_count
 
     print(f"Total pixels: {len(pixels)}")
-    print(f"Valid pixels (not 0xFFF): {valid_count} ({100*valid_count/len(pixels):.1f}%)")
-    print(f"Empty pixels (0xFFF): {empty_count} ({100*empty_count/len(pixels):.1f}%)")
+    print(f"Valid pixels (not 0x555): {valid_count} ({100*valid_count/len(pixels):.1f}%)")
+    print(f"Empty pixels (0x555): {empty_count} ({100*empty_count/len(pixels):.1f}%)")
 
     if len(pixels) > 0:
         min_val = min(pixels)

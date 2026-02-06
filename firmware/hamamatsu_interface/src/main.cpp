@@ -1,11 +1,10 @@
 #include <Arduino.h>
 #include <usb_custom.h>
 #include <imxrt.h>
-#include <DMAChannel.h>
 #include "reverse_table.h"
 
-// C7942 native resolution is 2400x2400 at 12.5 MHz
-// Using DTCM row buffer (fast RAM) for capture, then pack to PSRAM
+// C7942 native resolution is 2400x2400 at 15.15 MHz PCLK
+// Direct PSRAM writes via D-cache (WB-WA), FlexSPI2 clocked at 132 MHz
 // 12-bit packing: 2400x2400x1.5 = 8.64MB, crop to 2400x2320 = 8.35MB fits
 #define SENSOR_ROWS 2320
 #define SENSOR_COLUMNS 2400
@@ -43,6 +42,9 @@ typedef struct __attribute__((__packed__)) {
   uint8_t state;
   uint32_t row;
   uint32_t col;
+  uint8_t stop_reason;       // 0=normal, 1=hsync_timeout
+  uint32_t dma_wait_total;   // total DMA wait loop iterations
+  uint32_t overhead_max_us;  // max inter-row overhead in microseconds
 } readout_state;
 volatile readout_state state;
 
@@ -52,27 +54,11 @@ typedef struct __attribute__((__packed__)) {
   uint8_t data[64 - 5];
 } control_req_t;
 
-// 12-bit packed buffer in PSRAM, row buffer in fast DMAMEM for capture
+// 12-bit packed buffer in PSRAM — writes go directly via D-cache (WB-WA)
 // Packed size: ROWS * COLS * 3 / 2 bytes (2 pixels = 3 bytes)
 #define PACKED_FRAME_SIZE ((uint32_t)SENSOR_ROWS * SENSOR_COLUMNS * 3 / 2)
+#define PACKED_ROW_BYTES (SENSOR_COLUMNS * 3 / 2)  // 3600 bytes per row
 uint8_t *packed_buffer = nullptr;
-
-// DMA capture buffer - 32-bit to match GPIO register width
-// 1x sampling - one DMA transfer per intended pixel
-#define SAMPLES_PER_ROW SENSOR_COLUMNS  // 2400 samples
-
-// Buffer for capture
-uint32_t dma_row_buffer[SAMPLES_PER_ROW] __attribute__((aligned(32)));
-
-// DMA channels for GPIO capture
-DMAChannel dma_gpio6;
-DMAChannel dma_gpio1;
-volatile bool dma_complete = false;
-
-void dma_isr() {
-  dma_gpio6.clearInterrupt();
-  dma_complete = true;
-}
 
 // External memory allocation helper
 extern "C" uint8_t external_psram_size;
@@ -98,39 +84,6 @@ uint32_t usb_handler(uint8_t *control_data, uint32_t len, uint8_t *return_data, 
   switch (req->command) {
     case 0x00:
       Serial.write("Ping!\n");
-
-      // DMA test - read one word from GPIO1 (not GPIO6 which has bus access issues)
-      {
-        uint32_t test_dest = 0xDEADBEEF;
-        Serial.printf("DMA test: GPIO1=0x%08X @ 0x%08X, GPIO6=0x%08X @ 0x%08X\n",
-                      GPIO1_PSR, (uint32_t)&GPIO1_PSR, GPIO6_PSR, (uint32_t)&GPIO6_PSR);
-
-        // Clear any previous errors
-        DMA_CERR = dma_gpio6.channel;
-
-        dma_gpio6.TCD->SADDR = &GPIO1_PSR;  // Use GPIO1 instead of GPIO6
-        dma_gpio6.TCD->SOFF = 0;
-        dma_gpio6.TCD->ATTR = 0x0202;
-        dma_gpio6.TCD->NBYTES = 4;
-        dma_gpio6.TCD->SLAST = 0;
-        dma_gpio6.TCD->DADDR = &test_dest;
-        dma_gpio6.TCD->DOFF = 0;
-        dma_gpio6.TCD->CITER = 1;
-        dma_gpio6.TCD->BITER = 1;
-        dma_gpio6.TCD->DLASTSGA = 0;
-        dma_gpio6.TCD->CSR = 0;
-        asm volatile("dsb");
-
-        dma_gpio6.enable();
-        dma_gpio6.triggerManual();
-        delayMicroseconds(10);
-
-        Serial.printf("DMA test: before=0xDEADBEEF, after=0x%08X\n", test_dest);
-        Serial.printf("DMA test: CITER=%d, ERR=0x%08X, ES=0x%08X\n",
-                      dma_gpio6.TCD->CITER, DMA_ERR, DMA_ES);
-        dma_gpio6.disable();
-      }
-
       return_data[0] = 0xA5;
       return_len = 1;
       break;
@@ -160,13 +113,16 @@ uint32_t usb_handler(uint8_t *control_data, uint32_t len, uint8_t *return_data, 
         Serial.write("Already busy!\n");
         return_data[0] = 0x01;
       } else {
-        // Initialize packed buffer to 0xFF (which unpacks to 0xFFF, 0xFFF)
+        // Initialize packed buffer to 0xAA (which unpacks to 0xAAA, 0xAAA)
         // This allows test_frame.py to detect uncaptured pixels
-        memset(packed_buffer, 0xFF, PACKED_FRAME_SIZE);
+        memset(packed_buffer, 0xAA, PACKED_FRAME_SIZE);
         arm_dcache_flush_delete(packed_buffer, PACKED_FRAME_SIZE);
         state.state = STATE_WAITING_ON_VSYNC;
         state.row = 0;
         state.col = 0;
+        state.stop_reason = 0;
+        state.dma_wait_total = 0;
+        state.overhead_max_us = 0;
         digitalWrite(PIN_EXT_TRIGGER, HIGH);
         return_data[0] = 0x00;
       }
@@ -187,50 +143,22 @@ end:
   return return_len;
 }
 
-// GPIO1 bit positions for sync signals (Pin 26=PCLK, Pin 38=VSYNC, Pin 39=HSYNC)
-// Teensy 4.1: Pin 26 -> GPIO1 bit 30, Pin 38 -> GPIO1 bit 28, Pin 39 -> GPIO1 bit 29
-#define GPIO1_PCLK_BIT  30
-#define GPIO1_VSYNC_BIT 28
-#define GPIO1_HSYNC_BIT 29
-#define GPIO1_PCLK_MASK  (1UL << GPIO1_PCLK_BIT)
-#define GPIO1_VSYNC_MASK (1UL << GPIO1_VSYNC_BIT)
-#define GPIO1_HSYNC_MASK (1UL << GPIO1_HSYNC_BIT)
+// Bit positions for sync signals (Pin 26=PCLK, Pin 38=VSYNC, Pin 39=HSYNC)
+// Teensy 4.1: Pin 26 -> bit 30, Pin 38 -> bit 28, Pin 39 -> bit 29
+#define PCLK_BIT  30
+#define VSYNC_BIT 28
+#define HSYNC_BIT 29
+#define PCLK_MASK  (1UL << PCLK_BIT)
+#define VSYNC_MASK (1UL << VSYNC_BIT)
+#define HSYNC_MASK (1UL << HSYNC_BIT)
 
-// Setup DMA with A_ON mode for oversampled capture
-void setup_dma_capture() {
-  // Configure DMA channel to read from GPIO1 (not GPIO6 - fast GPIO isn't DMA accessible)
-  dma_gpio6.begin();
-  dma_gpio6.source(GPIO1_PSR);
-  dma_gpio6.destinationBuffer(dma_row_buffer, SAMPLES_PER_ROW * sizeof(uint32_t));
-  dma_gpio6.transferSize(4);  // 32-bit transfers
-  dma_gpio6.transferCount(SAMPLES_PER_ROW);
-  dma_gpio6.interruptAtCompletion();
-  dma_gpio6.attachInterrupt(dma_isr);
 
-  // Configure DMAMUX for A_ON (always-on) mode - continuous triggering
-  volatile uint32_t *dmamux = (volatile uint32_t *)0x400EC000;
-  dma_gpio6.triggerAtHardwareEvent(0);  // Placeholder
-  dmamux[dma_gpio6.channel] = (1 << 31) | (1 << 29);  // ENBL | A_ON
-
-  Serial.println("DMA capture configured with A_ON mode");
-  Serial.printf("  DMA channel = %d\n", dma_gpio6.channel);
-  Serial.printf("  Samples per row = %d\n", SAMPLES_PER_ROW);
-  Serial.printf("  DMAMUX = 0x%08X\n", dmamux[dma_gpio6.channel]);
-}
-
-// Pack two 12-bit values into 3 bytes
-// Layout: byte0 = p0[7:0], byte1 = p1[3:0]<<4 | p0[11:8], byte2 = p1[11:4]
-inline void pack_12bit(uint16_t p0, uint16_t p1, uint8_t *out) {
-  out[0] = p0 & 0xFF;
-  out[1] = ((p1 & 0x0F) << 4) | ((p0 >> 8) & 0x0F);
-  out[2] = (p1 >> 4) & 0xFF;
-}
-
-// Temporary row buffer for extracted pixels
-uint16_t pixel_row_buffer[SENSOR_COLUMNS];
-
-// Capture using tight polling loop
-// At 12.5 MHz pixel clock and 600 MHz CPU, we have 48 cycles per pixel
+// PCLK-synchronized capture: direct PSRAM writes via D-cache (WB-WA)
+// C7942: 15.15 MHz PCLK (66 ns/pixel, 39.6 CPU cycles/pixel at 600 MHz)
+// FlexSPI2 clocked at 132 MHz (up from 88 MHz). D-cache absorbs strb writes;
+// evictions write 32-byte cache lines to PSRAM. Cache write-allocate fills
+// cause ~400 ns stalls per line (at 132 MHz), 113 lines/row = ~45 us overhead.
+// Total row time: ~160 us capture + ~45 us overhead = ~205 us < 208 us period.
 FASTRUN void acquire_frame() {
   if (packed_buffer == nullptr) {
     state.state = STATE_IDLE;
@@ -238,89 +166,107 @@ FASTRUN void acquire_frame() {
   }
 
   // Wait for VSYNC rising edge
-  while (!(GPIO1_PSR & GPIO1_VSYNC_MASK)) {
+  while (!(GPIO6_PSR & VSYNC_MASK)) {
     if (state.state != STATE_WAITING_ON_VSYNC) return;
   }
 
   state.state = STATE_ACQUIRING;
 
-  // Pointer to current position in packed buffer
-  uint8_t *pack_ptr = packed_buffer;
+  uint8_t *psram_ptr = packed_buffer;
+  uint32_t row_max_cycles = 0;
 
-  // Skip initial rows to center the vertical crop (interrupts still enabled)
+  // Disable interrupts for entire frame
+  __disable_irq();
+
+  // Skip initial rows to center the vertical crop
   for (uint32_t skip = 0; skip < SKIP_ROWS; skip++) {
-    while (!(GPIO1_PSR & GPIO1_HSYNC_MASK)) {}
-    while (GPIO1_PSR & GPIO1_HSYNC_MASK) {}
+    while (!(GPIO6_PSR & HSYNC_MASK)) {}
+    while (GPIO6_PSR & HSYNC_MASK) {}
   }
 
   for (uint32_t row = 0; row < SENSOR_ROWS; row++) {
     state.row = row;
 
     // Wait for HSYNC high (start of row) with timeout
-    uint32_t timeout = 10000000;  // ~17ms at 600MHz
-    while (!(GPIO1_PSR & GPIO1_HSYNC_MASK)) {
+    uint32_t timeout = 10000000;
+    while (!(GPIO6_PSR & HSYNC_MASK)) {
       if (--timeout == 0) {
-        // No more rows from sensor
         __enable_irq();
+        state.stop_reason = 1;  // HSYNC timeout
         Serial.printf("HSYNC timeout at row %lu\n", row);
         goto done;
       }
     }
 
-    // Clear row buffer
-    memset(dma_row_buffer, 0xFF, SAMPLES_PER_ROW * sizeof(uint32_t));
+    uint32_t t0 = ARM_DWT_CYCCNT;
 
-    // Disable interrupts only during pixel capture
-    __disable_irq();
-
-    // Wait for PCLK rising edge to synchronize
-    while (!(GPIO1_PSR & GPIO1_PCLK_MASK)) {}  // Wait for PCLK high
-    while (GPIO1_PSR & GPIO1_PCLK_MASK) {}      // Wait for PCLK low
-
-    // Fixed-rate sampling - oversample slightly (faster than pixel clock)
-    // to ensure we capture all pixels. Some duplicates are OK.
-    // Loop body: LDR+STR ~10 cycles, SUBS+BNE ~4 = ~14 cycles
-    // With 26 NOPs: ~40 cycles total → 15 MHz sample rate (1.2x oversample)
+    // Capture directly to PSRAM via D-cache (WB-WA absorbs strb writes)
     volatile uint32_t *gpio6_ptr = &GPIO6_PSR;
-    uint32_t *buf = dma_row_buffer;
-    uint32_t count = SENSOR_COLUMNS;
+    uint8_t *pack = psram_ptr;  // Write directly to PSRAM address
+    uint32_t count = SENSOR_COLUMNS / 2;  // 1200 pixel pairs
+    uint32_t pclk_mask = PCLK_MASK;
 
+    // C7942 data sampling convention (see EXPERIMENTS.md Exp 3):
+    // Tdd (34 ns) > Tppw (33 ns) means pixel N's data appears AFTER PCLK N falls.
+    // When GPIO6_PSR shows PCLK=1, data bits = pixel N-1 (settled 32 ns ago).
+    // We extract data from the SAME read that detected the edge — no re-read.
+    // A "prime" read discards the first edge (pre-pixel-1 garbage), then
+    // 1200 pairs read edges 2-2401, capturing pixels 1-2400.
     asm volatile(
-      "1:                        \n\t"
-      "  ldr r2, [%[gpio6]]      \n\t"   // Load GPIO6_PSR
-      "  str r2, [%[buf]], #4    \n\t"   // Store and increment buf
-      "  nop; nop; nop; nop      \n\t"   // 4
-      "  subs %[cnt], #1         \n\t"   // Decrement counter
-      "  bne 1b                  \n\t"   // Loop if not zero
-      : [buf] "+r" (buf), [cnt] "+r" (count)
-      : [gpio6] "r" (gpio6_ptr)
-      : "r2", "memory", "cc"
+      // -- Prime: read first PCLK edge, discard data --
+      "0:                              \n\t"
+      "  ldr r2, [%[gpio6]]           \n\t"
+      "  tst r2, %[pclk]              \n\t"
+      "  beq 0b                       \n\t"
+      "5:                              \n\t"
+      "  ldr r2, [%[gpio6]]           \n\t"
+      "  tst r2, %[pclk]              \n\t"
+      "  bne 5b                       \n\t"
+      // -- Main loop: 1200 pixel pairs --
+      // -- Pixel A: wait for PCLK rising, extract from edge-detect read --
+      "1:                              \n\t"
+      "  ldr r2, [%[gpio6]]           \n\t"
+      "  tst r2, %[pclk]              \n\t"
+      "  beq 1b                       \n\t"
+      "  ubfx r3, r2, #16, #12        \n\t"  // pixel A: bits[27:16] of edge read
+      // -- Wait for PCLK falling edge --
+      "2:                              \n\t"
+      "  ldr r2, [%[gpio6]]           \n\t"
+      "  tst r2, %[pclk]              \n\t"
+      "  bne 2b                       \n\t"
+      // -- Pixel B: wait for PCLK rising, extract from edge-detect read --
+      "3:                              \n\t"
+      "  ldr r2, [%[gpio6]]           \n\t"
+      "  tst r2, %[pclk]              \n\t"
+      "  beq 3b                       \n\t"
+      "  ubfx r4, r2, #16, #12        \n\t"  // pixel B: bits[27:16] of edge read
+      // -- Pack pixel pair into 3 bytes (PSRAM via D-cache) --
+      "  strb r3, [%[pack]], #1       \n\t"  // byte0 = pA[7:0]
+      "  lsr r5, r3, #8              \n\t"   // r5 = pA[11:8]
+      "  and r2, r4, #0x0F           \n\t"   // r2 = pB[3:0]
+      "  orr r5, r5, r2, lsl #4      \n\t"   // r5 = pB[3:0]<<4 | pA[11:8]
+      "  strb r5, [%[pack]], #1       \n\t"  // byte1
+      "  lsr r5, r4, #4              \n\t"   // r5 = pB[11:4]
+      "  strb r5, [%[pack]], #1       \n\t"  // byte2
+      // -- Wait for PCLK falling edge --
+      "4:                              \n\t"
+      "  ldr r2, [%[gpio6]]           \n\t"
+      "  tst r2, %[pclk]              \n\t"
+      "  bne 4b                       \n\t"
+      // -- Loop --
+      "  subs %[cnt], #1              \n\t"
+      "  bne 1b                       \n\t"
+      : [pack] "+r" (pack), [cnt] "+r" (count)
+      : [gpio6] "r" (gpio6_ptr), [pclk] "r" (pclk_mask)
+      : "r2", "r3", "r4", "r5", "memory", "cc"
     );
 
-    uint32_t col = SENSOR_COLUMNS;  // We captured exactly SENSOR_COLUMNS
+    // Measure row time (capture + cache stall overhead)
+    uint32_t row_cycles = ARM_DWT_CYCCNT - t0;
+    if (row_cycles > row_max_cycles) row_max_cycles = row_cycles;
 
-    // Re-enable interrupts
-    __enable_irq();
-
-    state.col = col;
-
-    // Pack captured pixels (without bit reversal - do that after frame)
-    uint32_t to_pack = (col < SENSOR_COLUMNS) ? col : SENSOR_COLUMNS;
-    for (uint32_t c = 0; c < to_pack; c += 2) {
-      uint16_t p0 = (dma_row_buffer[c] >> GPIO6_DATA_SHIFT) & 0xFFF;
-      uint16_t p1 = (c + 1 < to_pack) ? ((dma_row_buffer[c + 1] >> GPIO6_DATA_SHIFT) & 0xFFF) : 0xFFF;
-      pack_ptr[0] = p0 & 0xFF;
-      pack_ptr[1] = ((p1 & 0x0F) << 4) | ((p0 >> 8) & 0x0F);
-      pack_ptr[2] = (p1 >> 4) & 0xFF;
-      pack_ptr += 3;
-    }
-    // Fill rest with 0xFFF (empty)
-    for (uint32_t c = to_pack; c < SENSOR_COLUMNS; c += 2) {
-      pack_ptr[0] = 0xFF;
-      pack_ptr[1] = 0xFF;
-      pack_ptr[2] = 0xFF;
-      pack_ptr += 3;
-    }
+    psram_ptr += PACKED_ROW_BYTES;
+    state.col = SENSOR_COLUMNS;
 
     // Turn off trigger at midpoint
     if (row == SENSOR_ROWS / 2) {
@@ -328,8 +274,16 @@ FASTRUN void acquire_frame() {
     }
   }
 
+  __enable_irq();
+
 done:
+  state.dma_wait_total = row_max_cycles;  // repurpose field: max row cycles
+  state.overhead_max_us = row_max_cycles / 600;  // cycles → us at 600 MHz
+  Serial.printf("Capture diag: rows=%lu, row_max=%lu cycles (%lu us)\n",
+                state.row, row_max_cycles, row_max_cycles / 600);
+
   // Post-process: apply bit-reversal to the entire packed buffer
+  // Data is in D-cache from the capture writes — no invalidation needed.
   Serial.write("Applying bit-reversal...\n");
   for (uint32_t i = 0; i < PACKED_FRAME_SIZE; i += 3) {
     // Unpack two 12-bit values
@@ -403,8 +357,13 @@ void setup() {
   digitalWrite(PIN_BIN1, LOW);
 #endif
 
-  // Setup DMA capture triggered by PCLK
-  setup_dma_capture();
+  // Increase FlexSPI2 (PSRAM) clock from 88 MHz to 132 MHz
+  // Source: PLL2 = 528 MHz, PODF=3 → div=4 → 132 MHz (PSRAM rated for 133 MHz)
+  // This reduces cache write-allocate fill latency by 1.5x (~300→200 ns per line)
+  CCM_CBCMR = (CCM_CBCMR & ~CCM_CBCMR_FLEXSPI2_PODF_MASK) | CCM_CBCMR_FLEXSPI2_PODF(3);
+
+  // Enable DWT cycle counter for timing measurements
+  ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
 
   usb_custom_set_handler(usb_handler);
   state.state = STATE_IDLE;
